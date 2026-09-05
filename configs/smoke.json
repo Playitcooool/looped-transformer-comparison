@@ -1,0 +1,4 @@
+{
+  "model": {"vocab_size": 512, "seq_len": 32, "width": 32, "heads": 4, "depth": 4, "loop_layers": 2, "loops": 2, "dropout": 0.0},
+  "training": {"steps": 4, "batch_size": 2, "grad_accum": 2, "lr": 0.001, "min_lr": 0.0001, "warmup_steps": 1, "weight_decay": 0.1, "grad_clip": 1.0, "eval_every": 2, "log_every": 1, "seed": 42, "device": "cpu", "precision": "fp32"}
+}

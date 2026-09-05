@@ -1,2 +1,4 @@
-def main() -> None:
-    print("Hello from looped-transformer-comparison!")
+"""Matched-depth looped transformer experiments."""
+from .cli import main
+
+__all__ = ['main']

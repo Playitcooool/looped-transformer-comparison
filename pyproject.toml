@@ -1,7 +1,7 @@
 [project]
 name = "looped-transformer-comparison"
 version = "0.1.0"
-description = "Add your description here"
+description = "SSH-ready matched-depth standard and looped transformer language-model experiments"
 readme = "README.md"
 authors = [
     { name = "Playitcool_", email = "129354153+Playitcooool@users.noreply.github.com" }
