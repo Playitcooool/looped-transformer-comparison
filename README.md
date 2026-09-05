@@ -1,108 +1,134 @@
 # Looped Transformer Comparison
 
-A headless, single-GPU experiment training two causal language models from scratch on WikiText-2. Target deployment: one NVIDIA H100 80GB. No GUI, notebook, pretrained weights, or external logging account is required.
+Headless, single-GPU language-model training from scratch on **WikiText-103**, targeting one NVIDIA H100 80GB. The default runner budgets **at most eight hours total for calibration and both models**, with measured step planning and a process watchdog. Download/tokenization and environment setup happen separately before the timed run. No GUI, notebook, pretrained weights or external logging account is required.
 
-## Controlled comparison
+## Matched architecture
 
 | Setting | Standard decoder | Looped decoder |
 |---|---:|---:|
 | Unique transformer blocks | 24 | 6 |
 | Stack repetitions | 1 | 4 |
 | Effective block applications | 24 | 24 |
-| Hidden width / attention heads | 1,088 / 17 | 1,088 / 17 |
+| Width / attention heads | 1,088 / 17 | 1,088 / 17 |
 | Parameters at vocabulary 8,192 | 350,451,328 | 94,508,032 |
 | Context / target BPE vocabulary | 256 / 8,192 | 256 / 8,192 |
-| Optimizer steps / tokens per step | 2,000 / 16,384 | 2,000 / 16,384 |
+| Microbatch / accumulation | 4 / 16 | 4 / 16 |
+| Training tokens per optimizer step | 16,384 | 16,384 |
+| Main optimizer steps | Same measured plan | Same measured plan |
 
-The constructor enforces `loop_layers * loops == depth`. The looped network passes hidden states through the same stack repeatedly; there is no detach, extra loop embedding, or loop-specific parameter. Both use pre-norm LayerNorm, causal SDPA attention, GELU MLPs with 4× expansion, learned positions added once, tied token/output embeddings, and zero dropout by default. There is no KV cache.
+`loop_layers * loops == depth` is enforced. The looped model passes hidden states through the same stack repeatedly, with full gradient flow and no additional loop-specific parameters. Both use pre-norm LayerNorm, causal SDPA attention, GELU MLPs with 4× expansion, learned positions added once, tied token/output embeddings and zero dropout. Each head has 64 dimensions. There is no KV cache.
 
-**This controls effective depth, width, data, batches, tokenizer, optimizer, learning-rate schedule and total training tokens, not parameter count.** The looped model has fewer unique parameters and optimizer states. Block forward/backward operation counts are broadly comparable, but optimizer cost, kernel behavior and wall time need not match. Shared parameters accumulate gradients from every use. Repeated depth still needs activation memory during backpropagation.
+This matches effective depth, width, tokenizer, batches, optimizer, learning-rate schedule and training tokens. **Unique parameter counts differ.** Optimizer cost, kernels and wall time can differ too; giving each model exactly four hours would not guarantee equal training tokens. Shared parameters accumulate gradients from every use, and repeated depth still requires activation memory.
 
-Both runs use the same seeded batch generator, so every optimizer step receives identical sampled training windows, including after resume. Initialization shares token/position weights and the first six block values at the same seed; the remaining standard blocks are independently initialized. Each model gets its own optimizer. GPU kernels may not be bitwise deterministic. Run several seeds before interpreting differences as reliable findings. No separately tuned hyperparameters are claimed.
+Both runs use identical seeded batch sequences. Token/position weights and the first six blocks share initial values at the same seed; remaining standard blocks initialize independently. Each model has its own optimizer. GPU execution is not claimed bitwise deterministic. Use multiple seeds for reliable research conclusions.
 
 ## H100 quick start
 
-Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and a working NVIDIA driver first. Clone this repository and enter its root, then:
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and a compatible NVIDIA driver. Clone/update this repository and enter its root:
 
 ```bash
 ./scripts/setup.sh
 ./scripts/check.sh --require-cuda
+# Prepare the larger dataset BEFORE the timed GPU job:
 ./scripts/prepare.sh
+# Calibration + both main runs, eight hours total:
 ./scripts/train.sh
 ```
 
-`setup.sh` creates this repository's `.venv` using the committed cross-platform `uv.lock`. PyTorch's Linux dependencies supply its CUDA runtime; the host still needs a compatible NVIDIA driver. The current lock selects PyTorch 2.14.0 and CUDA 13 Linux dependencies, with Linux glibc 2.28+ wheels. CUDA 13 normally needs an R580-or-newer NVIDIA driver; see [NVIDIA compatibility guidance](https://docs.nvidia.com/deploy/cuda-compatibility/latest/forward-compatibility.html). Check the reported CUDA build and GPU before training. If your cluster has an older driver, ask its administrator for a compatible runtime or resolve a matching older PyTorch version in this project before running both arms; do not mix runtimes between arms. Python is pinned to 3.12. The default configuration explicitly requests BF16; it fails clearly on unsupported hardware rather than silently changing precision.
+Preparation now defaults to `wikitext-103-raw-v1` under `data/wikitext103`. Existing WikiText-2 data does not become WikiText-103: prepare the new directory once. Fresh larger-data training cannot resume the old tokenizer/checkpoints.
 
-Training runs the standard model, then the looped model, on one visible GPU. The default output directory is `runs/h100-350m`; start a fresh run because previous 42M checkpoints are incompatible. The earlier small configuration is preserved as `configs/h100-small.json` (use a separate output directory). The default processes **32,768,000 training tokens per model**. This remains a bounded small-data comparison, not a claim that a 350M model is fully pretrained. WikiText-2 windows will be reused extensively; watch validation loss for overfitting. WikiText-103 is available below for a larger corpus, with the same prepared data and token budget in both arms. Data windows are sampled with replacement; this is a fixed-token-budget experiment, not an epoch-based traversal. Training and validation print JSON to stdout with immediate flushing.
+The lock selects PyTorch 2.14.0 with CUDA 13 Linux dependencies and glibc 2.28+ wheels. CUDA 13 normally needs an R580-or-newer NVIDIA driver; see [NVIDIA compatibility guidance](https://docs.nvidia.com/deploy/cuda-compatibility/latest/forward-compatibility.html). `setup.sh` uses the project-local Python 3.12 environment and committed `uv.lock`. It does not change the host driver. The H100 preset requires BF16; verify the CUDA build and visible device using `check.sh`. On an older cluster runtime, resolve a compatible PyTorch build before both arms, rather than mixing runtimes between models.
 
 ```bash
-# A noninteractive SSH shell, keep running after disconnect:
+# Keep running after an SSH disconnect:
 nohup ./scripts/train.sh > training.log 2>&1 &
-# Or submit from the repository root, adapting partition/account to your cluster:
+# Or submit from the repository root after preparation:
 sbatch scripts/train.sbatch
-# Select a GPU outside a scheduler, if needed:
-CUDA_VISIBLE_DEVICES=0 ./scripts/train.sh --output runs/h100-350m-seed42
-# Continue interrupted paired training (also starts the second model if needed):
+# Explicit GPU outside Slurm:
+CUDA_VISIBLE_DEVICES=0 ./scripts/train.sh --output runs/wiki103-seed42-8h
+# Shorter total budget:
+./scripts/train.sh --hours 4 --output runs/wiki103-4h
+```
+
+Run one of these alternatives, not simultaneous jobs writing the same directory. The Slurm example requests `08:00:00`, one GPU, eight CPUs and 32GB host RAM; adapt the partition/account to your cluster. Scheduler setup/check time is also inside that allocation, so the scheduler remains the ultimate hard limit. The runner honors `CUDA_VISIBLE_DEVICES`.
+
+## How the eight-hour budget works
+
+1. The runner records an absolute deadline at startup. Default output: `runs/h100-350m-wiki103-8h`.
+2. It trains a disposable copy of each architecture for eight optimizer steps, measuring training time and the surrounding initialization, validation and checkpoint overhead. Its final timing pass uses validation again, **not the test set**. Calibration is included in the time budget but excluded from the reported main training tokens.
+3. The planner chooses a shared optimizer-step count using both measured speeds, recurring evaluation costs, a 5% timing margin and a five-minute reserve. It caps steps at `configs/h100-8h.json`'s upper limit (1,000,000), writes `resolved-config.json`, and adjusts warmup to at most 5% of planned steps. Validation/checkpoint cadence is 500 steps. Both main arms restart from scratch at the same seed.
+4. The standard model runs, followed by the looped model. Each finishes its identical planned schedule and evaluates its validation-selected checkpoint on the held-out test set. `comparison.json` is emitted only after both complete with matching token budgets.
+
+The aim is to use most of the eight-hour allocation, typically with some headroom. **Actual duration/token throughput is not known until calibration on your H100.** We do not claim an eight-hour benchmark or guarantee completion: contention, thermal changes and slow checkpoint storage can invalidate an estimate. A separate parent process terminates a worker near the deadline and kills it if necessary. This protects the time cap at the cost of possibly stopping before a matched comparison completes. Slurm enforces the external eight-hour allocation. OS-level stalls can delay userspace process cleanup.
+
+Progress is flushed to `training.log` (when redirected), per-model `standard.log` / `looped.log`, and each model's `metrics.jsonl`. `budget.json` stores measured timings, the planned tokens, the original deadline and completion/incomplete status. Use `tail -f runs/h100-350m-wiki103-8h/standard.log` to watch the active arm.
+
+## Interruptions and resume
+
+```bash
+# Resume within the ORIGINAL eight-hour deadline, if checkpoints exist:
 ./scripts/train.sh --resume
 ```
 
-Do not launch both the quick-start training and nohup/Slurm examples for the same directory. A fresh run rejects occupied model output directories. Resume requires exactly matching settings and data checksums, and restores model, optimizer, step, data RNG and PyTorch CPU/CUDA RNG states. It continues from the last validation checkpoint (every 100 steps by default); work since that checkpoint is lost. Keep `last.pt` and `best.pt` together. Checkpoint writes use an atomic rename. Resume on the same device/runtime for reproducibility. Metrics may contain repeated steps if a process died after logging but before checkpointing.
+Resume does not grant another eight hours; downtime counts against the original deadline. It checks settings and data identity. If calibration was interrupted, start with a new output directory to obtain valid timings. If a main model stopped before its first checkpoint, a new output is required. The latest periodic `last.pt` and selected `best.pt` remain available after a timeout; work since the last checkpoint is lost. A forced termination cannot promise a final save. No comparison is reported for incomplete or unequal runs.
 
-**Resources:** the default standard model is approximately 350M parameters; the looped model is approximately 94.5M. Width 1,088 with 17 heads retains 64 dimensions per head. Microbatch size 4 and accumulation 16 preserve 16,384 tokens per optimizer step while limiting activation memory. FP32 parameters, gradients and Adam moments alone take about 5.6GB for the standard model; activations, attention workspace, logits and temporary copies require additional memory. Actual peak memory on H100 has not been measured. CPU RAM request in the Slurm example is 32GB. Allow roughly 25–35GB of free disk for the Linux CUDA dependencies, caches, data and paired optimizer checkpoints (an estimate). Runtime is not measured on H100: the first logged steps and `train_tokens_per_second` provide the basis for an estimate. The 4-hour Slurm limit is a configurable allocation request, not a benchmark. Scale batch size and inverse accumulation together to retain 16,384 tokens/step. This project intentionally does not attempt multi-GPU training.
+After the deadline, you may explicitly continue in **a new allocation outside the original eight-hour budget**:
+
+```bash
+uv run looped-transformer-comparison compare \
+  --config runs/h100-350m-wiki103-8h/resolved-config.json \
+  --data data/wikitext103 --output runs/h100-350m-wiki103-8h --resume
+```
+
+This fixed-step command has no time watchdog; choose it only when intentionally extending the experiment. Its completed comparison does not rewrite the earlier budget record. Never change `resolved-config.json` for a resume. Model, optimizer, step, data RNG and PyTorch CPU/CUDA RNG states are restored, with exact same-device/runtime CPU continuation covered by tests. Checkpoint writes use atomic rename; keep both checkpoint files. Logs can repeat steps after a crash between logging and checkpointing.
 
 ## Data and evaluation
 
-The downloader uses [Salesforce/WikiText](https://huggingface.co/datasets/Salesforce/wikitext) `wikitext-2-raw-v1` at a pinned revision. Respect the source dataset's CC BY-SA attribution/license terms. Byte-level BPE is trained **only on the training split**, including a full byte alphabet; its actual vocabulary size is saved and used by both models. Nonblank source rows are independently encoded and terminated by `<eos>`. Packed attention can span row boundaries. Train, validation and test remain separate token streams.
+The [Salesforce WikiText dataset](https://huggingface.co/datasets/Salesforce/wikitext) contains Wikipedia articles; WikiText-103 is the larger variant, with over 100 million source tokens (not our learned BPE-token count). We pin revision `f776294184f13b8ff2337b3841cf9269a6216d1e`. Observe the source dataset's attribution/license terms.
 
-The manifest records the source revision, tokenizer checksum and all split checksums/token counts. Training validates them before use. Local text is also supported:
+Byte-level BPE with a full byte alphabet trains **only on the training split**. The actual vocabulary size is saved and used by both models, so parameter counts may vary slightly when a tiny custom corpus cannot fill the vocabulary. Nonblank source rows are encoded with `<eos>` boundaries; packed attention can span rows. Train, validation and test streams remain separate. Preparation iterates dataset rows and writes token IDs in bounded chunks instead of retaining the whole tokenized corpus as a Python list; tokenizer training itself still needs memory.
+
+The manifest records source revision, tokenizer hash and split checksums/counts. Training checks these before use. Training windows are sampled with replacement, so the resolved token budget is not an epoch count and can exceed the corpus size.
 
 ```bash
-./scripts/prepare.sh --local-dir /path/to/text-splits --output data/custom --vocab-size 8192
-# Folder must contain train.txt, validation.txt and test.txt, split by the caller.
-# WikiText-103 is optional (larger memory/download requirements):
-./scripts/prepare.sh --dataset-config wikitext-103-raw-v1 --output data/wikitext103
+# Optional small original dataset:
+./scripts/prepare.sh --dataset-config wikitext-2-raw-v1 --output data/wikitext2
+# Or caller-provided train.txt, validation.txt and test.txt:
+./scripts/prepare.sh --local-dir /path/to/text-splits --output data/custom
 ```
 
-Validation evaluates all next-token targets in fixed, non-overlapping context windows, including the short final window. Each target is counted once; context resets every 256 targets. Validation selects `best.pt`. The held-out test split is evaluated at completion using that checkpoint. Reported perplexity is **this tokenizer's BPE-token perplexity**, not directly comparable with published word-level WikiText perplexities or different context protocols. Repeated test inspection should not guide hyperparameter tuning.
+Validation covers every next-token target once in fixed non-overlapping windows, including the short tail, with context reset every 256 targets. It selects `best.pt`; held-out test evaluation follows main training. Perplexity is this tokenizer's **BPE-token perplexity**, not published word-level WikiText perplexity. Calibration does not select model settings by test performance. Do not tune using repeated inspection of test scores.
 
-## Outputs and commands
+## Outputs and other commands
 
-Under `runs/h100-350m/standard/` and `runs/h100-350m/looped/`:
+Each main architecture directory contains `metadata.json`, `metrics.jsonl`, `last.pt`, `best.pt` and, on completion, `result.json`. The parent holds `budget.json`, `resolved-config.json`, logs, disposable `calibration/` runs and, only after successful paired completion, `comparison.json` / `comparison.md`.
 
-- `metadata.json`: resolved settings, parameter counts, data identity and runtime information.
-- `metrics.jsonl`: training loss and validation measurements.
-- `last.pt`: resumable state; `best.pt`: lowest validation-loss state.
-- `result.json`: held-out test loss/perplexity, tokens, training-only throughput and peak CUDA allocation.
-
-The parent contains `comparison.json` and `comparison.md`. Training-only time includes batch construction and optimizer updates, excludes validation/checkpoint/test time, and synchronizes CUDA. Peak CUDA allocation includes evaluation and may differ after resume; it is allocated tensor memory rather than total process VRAM. The comparison rejects mismatched settings, data and token budgets.
+Results report parameter counts, held-out loss/perplexity, training tokens, training-only throughput and peak CUDA allocation. Training time synchronizes CUDA and includes batch construction/optimizer work, excluding evaluation and saving. Peak allocation includes evaluation, can vary after resume, and is not total process VRAM.
 
 ```bash
-./scripts/evaluate.sh --checkpoint runs/h100-350m/standard/best.pt
-./scripts/evaluate.sh --checkpoint runs/h100-350m/looped/best.pt
-./scripts/infer.sh --checkpoint runs/h100-350m/looped/best.pt --prompt 'The history of science'
-# Greedy generation:
-./scripts/infer.sh --checkpoint runs/h100-350m/standard/best.pt --prompt 'The Earth' --temperature 0
-# Train just one architecture:
+./scripts/evaluate.sh --checkpoint runs/h100-350m-wiki103-8h/standard/best.pt
+./scripts/infer.sh --checkpoint runs/h100-350m-wiki103-8h/looped/best.pt --prompt 'The history of science'
+# Fixed-step experiment (not time bounded):
+uv run looped-transformer-comparison compare --config configs/h100.json --output runs/fixed350m
+# One architecture only:
 uv run looped-transformer-comparison train --architecture standard --output runs/single
-# Pause at a checkpoint without changing the full LR schedule:
-uv run looped-transformer-comparison train --architecture looped --output runs/paused --stop-after 100
-uv run looped-transformer-comparison train --architecture looped --output runs/paused --resume
 # Debug synchronous CUDA errors:
 ./scripts/debug.sh --architecture looped --output runs/debug --stop-after 1
 ```
 
-Evaluation command uses FP32 explicitly for portability; the final training report uses configured BF16 on H100, so tiny numerical differences are expected. Generation verifies the tokenizer checksum and rolls the context window when full. These small models are experimental and should not be expected to produce fluent text after a smoke run.
+Standalone evaluation uses FP32 for portability; main H100 reports use configured BF16, so small numerical differences are expected. Generation checks tokenizer identity and rolls the context window.
 
-## Local verification and custom experiments
+**Resources:** standard FP32 parameters, gradients and Adam moments alone take about 5.6GB; activations, logits, attention workspace and temporary copies require more. H100 peak memory/runtime remain unmeasured. Allow roughly 40–50GB disk for CUDA dependencies/caches, the larger prepared dataset, calibration and main checkpoints (estimate). Model training uses microbatch 4 and accumulation 16. If adjusting memory use, change these inversely to retain 16,384 tokens/step in both arms. There is no multi-GPU implementation.
+
+## Local verification and variants
 
 ```bash
-./scripts/setup.sh
 uv run pytest -q
-# Small real-WikiText check (full WikiText validation can still take time on CPU):
-./scripts/prepare.sh --output data/smoke --vocab-size 512
-./scripts/train.sh --config configs/smoke.json --data data/smoke --output runs/smoke
+# Small numerical check via the FIXED-step command:
+./scripts/prepare.sh --dataset-config wikitext-2-raw-v1 --output data/smoke --vocab-size 512
+uv run looped-transformer-comparison compare --config configs/smoke.json --data data/smoke --output runs/smoke
 ```
 
-`configs/smoke.json` is for CPU verification only. For research runs, copy `configs/h100.json`, modify `training.seed`, and give each paired run a separate output directory. Try seeds 42, 43 and 44. To change loop factor, retain `depth == loop_layers * loops`, for example 24 = 12×2, 6×4 or 3×8. Keeping 24×1 for the looped model gives the architecture-equivalence control. Each configuration has the same width in both arms; parameter matching is a different experiment.
+`configs/smoke.json` is for CPU verification. `configs/h100.json` preserves the fixed 2,000-step 350M experiment, and `configs/h100-small.json` preserves the earlier 42M model. The timed default uses `configs/h100-8h.json`; its million-step value is an upper bound, not a promise to run that many steps. Pass `--config` to the timed runner to change architecture, seed or other settings, keeping a fresh output directory. Different loop factors must preserve depth, e.g. 24 = 12×2, 6×4 or 3×8. Use 24×1 for the architecture-equivalence control.
 
-Implementation uses [PyTorch causal scaled-dot-product attention](https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html). Setup and data preparation need internet; after dependencies and data are cached, training/evaluation are fully local and headless. Data, environments, secrets, logs and model weights are ignored by Git.
+Implementation uses [PyTorch causal SDPA](https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html). Training/evaluation are local and headless after preparation. Git excludes data, checkpoints, environments, secrets and logs.

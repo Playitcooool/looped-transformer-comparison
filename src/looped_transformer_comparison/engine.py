@@ -114,7 +114,7 @@ def load_checkpoint(path):
     return torch.load(path, map_location='cpu', weights_only=True)
 
 
-def train(config_path, data_dir, output, architecture, resume=False, stop_after=None):
+def train(config_path, data_dir, output, architecture, resume=False, stop_after=None, calibration=False):
     c = read_config(config_path)
     t = c['training']
     device = device_for(t['device'])
@@ -135,7 +135,7 @@ def train(config_path, data_dir, output, architecture, resume=False, stop_after=
     step, best_loss, train_seconds = 0, float('inf'), 0.0
     if resume:
         ck = load_checkpoint(out / 'last.pt')
-        if ck['config'] != c or ck['manifest'] != manifest or ck['architecture'] != architecture:
+        if ck['config'] != c or ck['manifest'] != manifest or ck['architecture'] != architecture or ck.get('calibration', False) != calibration:
             raise ValueError('resume config, data or architecture mismatch')
         model.load_state_dict(ck['model'])
         optimizer.load_state_dict(ck['optimizer'])
@@ -189,7 +189,7 @@ def train(config_path, data_dir, output, architecture, resume=False, stop_after=
             best_loss = min(best_loss, val['loss'])
             ck = {'model': model.state_dict(), 'optimizer': optimizer.state_dict(), 'step': step,
                   'best_loss': best_loss, 'train_seconds': train_seconds, 'config': c, 'manifest': manifest,
-                  'architecture': architecture, 'batch_rng': generator.get_state(),
+                  'architecture': architecture, 'calibration': calibration, 'batch_rng': generator.get_state(),
                   'torch_rng': torch.get_rng_state(),
                   'cuda_rng': torch.cuda.get_rng_state_all() if device.type == 'cuda' else []}
             save_checkpoint(out / 'last.pt', ck)
@@ -203,10 +203,10 @@ def train(config_path, data_dir, output, architecture, resume=False, stop_after=
         return {'status': 'paused', 'step': step}
     ck = load_checkpoint(out / 'best.pt')
     model.load_state_dict(ck['model'])
-    test = evaluate(model, streams['test'], t['batch_size'], device, t['precision'])
+    test = evaluate(model, streams['validation' if calibration else 'test'], t['batch_size'], device, t['precision'])
     tokens = step * t['batch_size'] * t['grad_accum'] * model.config.seq_len
-    result = {**metadata, 'status': 'complete', 'steps': step, 'train_tokens': tokens,
-              'best_step': ck['step'], 'best_validation_loss': best_loss, 'test': test,
+    result = {**metadata, 'status': 'calibration_complete' if calibration else 'complete', 'steps': step, 'train_tokens': tokens,
+              'best_step': ck['step'], 'best_validation_loss': best_loss, ('validation_timing_pass' if calibration else 'test'): test,
               'train_seconds': train_seconds, 'train_tokens_per_second': tokens / train_seconds,
               'peak_cuda_allocated_bytes': torch.cuda.max_memory_allocated(device) if device.type == 'cuda' else None}
     (out / 'result.json').write_text(json.dumps(result, indent=2) + '\n')

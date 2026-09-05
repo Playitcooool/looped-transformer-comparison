@@ -240,7 +240,142 @@ def test_large_h100_cli_defaults(monkeypatch, tmp_path, command):
     cli_module.main()
     assert len(calls) == {'train': 1, 'compare': 2, 'report': 0}[command]
     for call in calls:
-        assert call[:2] == ('configs/h100.json', 'data/wikitext2')
+        assert call[:2] == ('configs/h100.json', 'data/wikitext103')
         expected = 'runs/h100-350m' + ('/' + call[3] if command == 'compare' else '')
         assert str(call[2]) == expected
     assert reports == ([] if command == 'train' else ['runs/h100-350m'])
+
+
+def test_planner_maximal_safe_common_budget_and_overhead():
+    from looped_transformer_comparison.budget import planned_steps
+    timings = [{'steps': 8, 'train_seconds': 16, 'wall_seconds': 19},
+               {'steps': 8, 'train_seconds': 24, 'wall_seconds': 28}]
+    plan = planned_steps(timings, 200, 10, 5, 100)
+    def estimate(n):
+        return 1.05 * (n * 5 + (math.ceil(n / 5) + 1) * 7)
+    assert plan['predicted_main_seconds'] == estimate(plan['steps'])
+    assert estimate(plan['steps']) <= 190 < estimate(plan['steps'] + 1)
+    assert planned_steps(timings, 200, 10, 5, 2)['steps'] == 2
+    assert plan['pair_train_seconds_per_step'] == 5
+    with pytest.raises(ValueError, match='Not enough time'):
+        planned_steps(timings, 11, 10, 5, 100)
+    with pytest.raises(ValueError):
+        planned_steps(timings, 10, 10, 5, 100)
+    with pytest.raises(ValueError):
+        planned_steps([{'steps': 8, 'train_seconds': float('nan'), 'wall_seconds': 19}] * 2, 100, 10, 5, 100)
+
+
+def test_budget_true_cpu_end_to_end_and_resume(dataset, config, tmp_path):
+    out = tmp_path / 'timed-pair'
+    args = ('budget', '--config', config, '--data', dataset, '--output', out,
+            '--hours', '0.02', '--reserve-minutes', '0.05', '--calibration-steps', '2')
+    cli(*args)
+    state = json.loads((out / 'budget.json').read_text())
+    assert state['status'] == 'complete'
+    assert state['elapsed_seconds'] < 72
+    assert state['deadline_unix'] - state['started_unix'] == pytest.approx(72)
+    assert len(state['measurements']) == 2
+    results = [json.loads((out / a / 'result.json').read_text()) for a in ('standard', 'looped')]
+    assert results[0]['steps'] == results[1]['steps'] == state['plan']['steps'] == 4
+    assert results[0]['train_tokens'] == results[1]['train_tokens'] == state['plan']['tokens_per_model'] == 128
+    for arch in ('standard', 'looped'):
+        calibration = json.loads((out / 'calibration' / arch / 'result.json').read_text())
+        assert calibration['status'] == 'calibration_complete'
+        assert 'test' not in calibration and 'validation_timing_pass' in calibration
+        assert load_checkpoint(out / arch / 'last.pt')['calibration'] is False
+    cli(*args, '--resume')
+    assert json.loads((out / 'budget.json').read_text()) == state
+    state.update(status='incomplete', deadline_unix=0)
+    (out / 'budget.json').write_text(json.dumps(state))
+    failed = cli(*args, '--resume', success=False)
+    assert 'Original budget expired' in failed.stderr
+    assert json.loads((out / 'budget.json').read_text())['deadline_unix'] == 0
+
+
+def test_real_watchdog_terminates_worker_process_group(tmp_path):
+    import time
+    from looped_transformer_comparison.budget import worker
+    marker = tmp_path / 'terminated'
+    script = tmp_path / 'sleep.py'
+    script.write_text('import signal, time, pathlib, sys, subprocess\n'
+                      'if len(sys.argv) == 2: subprocess.Popen([sys.executable, __file__, sys.argv[1] + "-child", "child"])\n'
+                      'signal.signal(signal.SIGTERM, lambda *_: (pathlib.Path(sys.argv[1]).write_text("terminated"), sys.exit(0)))\n'
+                      'time.sleep(60)\n')
+    start = time.monotonic()
+    with pytest.raises(TimeoutError, match='Worker stopped'):
+        worker([sys.executable, str(script), str(marker)], tmp_path / 'log', time.time() + 5.4)
+    assert marker.read_text() == 'terminated'
+    child_marker = marker.with_name(marker.name + '-child')
+    for _ in range(100):
+        if child_marker.exists(): break
+        time.sleep(0.01)
+    assert child_marker.read_text() == 'terminated'
+    assert time.monotonic() - start < 5
+    with pytest.raises(RuntimeError, match='code 3'):
+        worker([sys.executable, '-c', 'raise SystemExit(3)'], tmp_path / 'fail.log', time.time() + 10)
+
+
+def test_budget_failure_persists_original_deadline(dataset, config, tmp_path, monkeypatch):
+    from looped_transformer_comparison import budget
+    out = tmp_path / 'failed-pair'
+    def fail(*args):
+        raise TimeoutError('simulated overrun')
+    monkeypatch.setattr(budget, 'worker', fail)
+    with pytest.raises(TimeoutError):
+        budget.run_budget(config, dataset, out)
+    state = json.loads((out / 'budget.json').read_text())
+    assert state['status'] == 'incomplete' and 'overrun' in state['reason']
+    with pytest.raises(TimeoutError):
+        budget.run_budget(config, dataset, out, resume=True)
+    assert json.loads((out / 'budget.json').read_text())['deadline_unix'] == state['deadline_unix']
+
+
+def test_prepare_line_semantics_and_streaming_flush(tmp_path, monkeypatch):
+    from looped_transformer_comparison import data as module
+    from tokenizers import Tokenizer
+    raw = tmp_path / 'raw'; raw.mkdir()
+    content = 'small cats\r\n\r\n  \nread words\nlast line'
+    for split in ('train', 'validation', 'test'):
+        (raw / f'{split}.txt').write_text(content)
+    out = tmp_path / 'normal'
+    prepare(out, 280, raw)
+    tokenizer = Tokenizer.from_file(str(out / 'tokenizer.json'))
+    expected = []
+    for row in content.splitlines():
+        if row.strip(): expected += tokenizer.encode(row).ids + [tokenizer.token_to_id('<eos>')]
+    for split in ('train', 'validation', 'test'):
+        assert np.fromfile(out / f'{split}.bin', dtype=np.uint32).tolist() == expected
+    class FakeTokenizer:
+        def __init__(self, *_): pass
+        def train_from_iterator(self, rows, trainer): assert list(rows) == ['small cats', 'read words', 'last line']
+        def save(self, path): Path(path).write_text('{}')
+        def get_vocab_size(self): return 280
+        def token_to_id(self, token): return 2
+        def encode(self, row): return type('Encoded', (), {'ids': [1] * 400_000})()
+    monkeypatch.setattr(module, 'Tokenizer', FakeTokenizer)
+    out = tmp_path / 'chunked'
+    manifest = prepare(out, 280, raw)
+    for split in ('train', 'validation', 'test'):
+        values = np.fromfile(out / f'{split}.bin', dtype=np.uint32)
+        assert len(values) == manifest['splits'][split]['tokens'] == 1_200_003
+        assert np.where(values == 2)[0].tolist() == [400_000, 800_001, 1_200_002]
+        assert (values[values != 2] == 1).all()
+
+
+def test_default_budget_dispatch_and_production_controls(monkeypatch):
+    from looped_transformer_comparison import cli as cli_module, budget
+    calls = []
+    monkeypatch.setattr(budget, 'run_budget', lambda *args: calls.append(args) or {})
+    monkeypatch.setattr(sys, 'argv', ['looped-transformer-comparison', 'budget'])
+    cli_module.main()
+    assert calls == [('configs/h100-8h.json', 'data/wikitext103', 'runs/h100-350m-wiki103-8h', 8.0, 5.0, 8, False)]
+    c = json.loads((ROOT / 'configs/h100-8h.json').read_text())
+    old = json.loads((ROOT / 'configs/h100.json').read_text())
+    assert c['model'] == old['model']
+    assert c['training']['steps'] == 1_000_000 and c['training']['eval_every'] == 500
+    assert 'comparison budget' in (ROOT / 'scripts/train.sh').read_text()
+    assert '#SBATCH --time=08:00:00' in (ROOT / 'scripts/train.sbatch').read_text()
+    monkeypatch.setattr(cli_module, 'prepare', lambda *args: calls.append(args) or {})
+    monkeypatch.setattr(sys, 'argv', ['looped-transformer-comparison', 'prepare'])
+    cli_module.main()
+    assert calls[-1] == ('data/wikitext103', 8192, None, 'wikitext-103-raw-v1')

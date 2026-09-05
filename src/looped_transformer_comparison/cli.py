@@ -20,30 +20,39 @@ def main():
     parser = argparse.ArgumentParser(description='Matched-depth standard vs looped causal language models')
     sub = parser.add_subparsers(dest='command', required=True)
     p = sub.add_parser('prepare')
-    p.add_argument('--output', default='data/wikitext2')
+    p.add_argument('--output', default='data/wikitext103')
     p.add_argument('--vocab-size', type=int, default=8192)
     p.add_argument('--local-dir', help='Folder containing train.txt, validation.txt, test.txt')
-    p.add_argument('--dataset-config', default='wikitext-2-raw-v1', choices=['wikitext-2-raw-v1', 'wikitext-103-raw-v1'])
+    p.add_argument('--dataset-config', default='wikitext-103-raw-v1', choices=['wikitext-2-raw-v1', 'wikitext-103-raw-v1'])
     for name in ('train', 'compare'):
         p = sub.add_parser(name)
         p.add_argument('--config', default='configs/h100.json')
-        p.add_argument('--data', default='data/wikitext2')
+        p.add_argument('--data', default='data/wikitext103')
         p.add_argument('--output', default='runs/h100-350m')
         p.add_argument('--resume', action='store_true')
         if name == 'train':
+            p.add_argument('--calibration', action='store_true', help=argparse.SUPPRESS)
             p.add_argument('--architecture', required=True, choices=['standard', 'looped'])
             p.add_argument('--stop-after', type=int, help='Checkpoint and pause after this absolute optimizer step')
+    p = sub.add_parser('budget')
+    p.add_argument('--config', default='configs/h100-8h.json')
+    p.add_argument('--data', default='data/wikitext103')
+    p.add_argument('--output', default='runs/h100-350m-wiki103-8h')
+    p.add_argument('--hours', type=float, default=8.0)
+    p.add_argument('--reserve-minutes', type=float, default=5.0)
+    p.add_argument('--calibration-steps', type=int, default=8)
+    p.add_argument('--resume', action='store_true')
     p = sub.add_parser('report')
     p.add_argument('--output', default='runs/h100-350m')
     p = sub.add_parser('evaluate')
     p.add_argument('--checkpoint', required=True)
-    p.add_argument('--data', default='data/wikitext2')
+    p.add_argument('--data', default='data/wikitext103')
     p.add_argument('--split', choices=['validation', 'test'], default='test')
     p.add_argument('--device', default='auto')
     p.add_argument('--batch-size', type=int, default=16)
     p = sub.add_parser('generate')
     p.add_argument('--checkpoint', required=True)
-    p.add_argument('--tokenizer', default='data/wikitext2/tokenizer.json')
+    p.add_argument('--tokenizer', default='data/wikitext103/tokenizer.json')
     p.add_argument('--prompt', required=True)
     p.add_argument('--max-new-tokens', type=int, default=100)
     p.add_argument('--temperature', type=float, default=0.8)
@@ -55,7 +64,11 @@ def main():
     if a.command == 'prepare':
         print(json.dumps(prepare(a.output, a.vocab_size, a.local_dir, a.dataset_config), indent=2))
     elif a.command == 'train':
-        print(json.dumps(train(a.config, a.data, a.output, a.architecture, a.resume, a.stop_after), indent=2))
+        kwargs = {'calibration': True} if a.calibration else {}
+        print(json.dumps(train(a.config, a.data, a.output, a.architecture, a.resume, a.stop_after, **kwargs), indent=2))
+    elif a.command == 'budget':
+        from .budget import run_budget
+        print(json.dumps(run_budget(a.config, a.data, a.output, a.hours, a.reserve_minutes, a.calibration_steps, a.resume), indent=2))
     elif a.command == 'compare':
         root = Path(a.output)
         # Reject occupied destinations before starting either architecture.
