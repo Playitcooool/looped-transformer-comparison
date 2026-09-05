@@ -1,0 +1,27 @@
+[project]
+name = "looped-transformer-comparison"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Playitcool_", email = "129354153+Playitcooool@users.noreply.github.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "datasets>=3,<5",
+    "numpy>=2,<3",
+    "tokenizers>=0.21,<1",
+    "torch>=2.6,<3",
+]
+
+[project.scripts]
+looped-transformer-comparison = "looped_transformer_comparison:main"
+
+[build-system]
+requires = ["uv_build>=0.11.21,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
