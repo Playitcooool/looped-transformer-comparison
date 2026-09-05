@@ -1,0 +1,4 @@
+{
+  "model": {"vocab_size": 8192, "seq_len": 256, "width": 512, "heads": 8, "depth": 12, "loop_layers": 3, "loops": 4, "dropout": 0.0},
+  "training": {"steps": 2000, "batch_size": 16, "grad_accum": 4, "lr": 0.0003, "min_lr": 0.00003, "warmup_steps": 100, "weight_decay": 0.1, "grad_clip": 1.0, "eval_every": 100, "log_every": 10, "seed": 42, "device": "auto", "precision": "bf16"}
+}

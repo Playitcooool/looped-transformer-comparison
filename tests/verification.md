@@ -37,8 +37,18 @@ A deliberately bounded verification subset used the first 4,096 training tokens 
 
 These tiny runs verify operation only; they do not support architecture-quality, speed, convergence, or H100 performance conclusions. Generated data and checkpoints remain under ignored `data/verify-wiki`, `data/verify-wiki-subset`, and `runs/verify-wiki-subset` directories and are not published to Git.
 
-## Default H100 configuration inspection
+## Historical 42M H100 configuration inspection
 
-Actual CPU instantiation of `configs/h100.json` gives **42,155,008** parameters for the 12-layer standard model and **13,783,552** parameters for the 3-layer looped model repeated 4 times. Both have effective depth 12. This is depth/token-budget matching; parameter count is intentionally different.
+Actual CPU instantiation of the original H100 configuration, now preserved as `configs/h100-small.json`, gives **42,155,008** parameters for the 12-layer standard model and **13,783,552** parameters for the 3-layer looped model repeated 4 times. Both have effective depth 12. This is depth/token-budget matching; parameter count is intentionally different.
 
 The Linux lock selects CUDA 13 dependencies for PyTorch 2.14 and a manylinux 2.28 wheel: plan for an R580+ NVIDIA driver, glibc 2.28+, and roughly 10–15 GB for the environment/cache. Actual Linux dependency installation, H100 BF16 kernels, CUDA RNG resume, GPU memory use, throughput, multi-hour training, and Slurm scheduling remain unverified and must be checked on the deployment host. No GPU timing or memory benchmark is claimed.
+
+## 350M default sizing update
+
+Independently verified 2026-09-05 by a separate testing agent on the same CPU-only macOS environment. The automated suite command above now gives **24 passed in 7.83 seconds**.
+
+The full production models were instantiated on PyTorch's `meta` device, which retains real module/tensor shapes without allocating the parameter storage. Parameter enumeration gives **350,451,328** for the standard model and **94,508,032** for the looped model. Forward hooks on a meta-device input confirm **24 block applications** for both architectures, using 24 distinct standard blocks versus 6 shared blocks repeated 4 times. Both output `[1, 8, 8192]` logits for an eight-token input. Width 1,088 and 17 attention heads give 64 dimensions per head. Meta execution verifies architecture and shape wiring; it does not verify numerical behavior, CUDA kernels, or GPU memory use.
+
+New regression checks verify that microbatch 4 × accumulation 16 × context 256 retains **16,384 tokens per optimizer step**, and 2,000 steps retain **32,768,000 training tokens per model**. The historical small preset matches the former default configuration exactly, including microbatch 16 × accumulation 4; all other training settings are unchanged. Mocked CLI dispatch verifies the new `runs/h100-350m` default for training, paired comparison and reporting, and the production config/data defaults. Existing numerical training, resume, data, evaluation and CLI integration tests still pass on the small CPU configurations.
+
+No new full-size training run, H100 execution, memory benchmark, or throughput measurement was performed. The earlier live WikiText smoke results remain the only live-corpus training evidence recorded here.

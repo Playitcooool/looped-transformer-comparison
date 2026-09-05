@@ -186,3 +186,61 @@ def test_cuda_device_selection_mocked(monkeypatch,name):
     expected=torch.device('cuda:2' if name=='cuda:2' else 'cuda:1')
     assert device_for(name)==expected
     assert seen==[expected]
+
+
+@pytest.mark.parametrize('architecture,count,unique_layers', [
+    ('standard', 350_451_328, 24), ('looped', 94_508_032, 6),
+])
+def test_large_h100_actual_model_size_and_depth(architecture, count, unique_layers):
+    config = ModelConfig(**json.loads((ROOT / 'configs/h100.json').read_text())['model'])
+    # Meta tensors verify the full architecture without allocating 350M weights.
+    with torch.device('meta'):
+        model = LanguageModel(config, architecture)
+        assert sum(p.numel() for p in model.parameters()) == count
+        assert len(model.blocks) == unique_layers
+        assert config.width // config.heads == 64
+        calls = []
+        handles = [block.register_forward_hook(lambda *_: calls.append(1)) for block in model.blocks]
+        logits = model(torch.ones((1, 8), dtype=torch.long))
+        assert logits.shape == (1, 8, config.vocab_size)
+        assert len(calls) == 24
+        for handle in handles:
+            handle.remove()
+
+
+def test_h100_size_change_preserves_training_token_budget_and_small_preset():
+    old = json.loads((ROOT / 'configs/h100-small.json').read_text())
+    large = json.loads((ROOT / 'configs/h100.json').read_text())
+    assert old['model'] == dict(vocab_size=8192, seq_len=256, width=512, heads=8,
+                               depth=12, loop_layers=3, loops=4, dropout=0.0)
+    assert old['training']['batch_size'] == 16 and old['training']['grad_accum'] == 4
+    assert large['training']['batch_size'] == 4 and large['training']['grad_accum'] == 16
+    for config in (old, large):
+        training = config['training']
+        tokens_per_step = training['batch_size'] * training['grad_accum'] * config['model']['seq_len']
+        assert tokens_per_step == 16_384
+        assert tokens_per_step * training['steps'] == 32_768_000
+    assert {k: v for k, v in old['training'].items() if k not in ('batch_size', 'grad_accum')} == {
+        k: v for k, v in large['training'].items() if k not in ('batch_size', 'grad_accum')}
+
+
+@pytest.mark.parametrize('command', ['train', 'compare', 'report'])
+def test_large_h100_cli_defaults(monkeypatch, tmp_path, command):
+    from looped_transformer_comparison import cli as cli_module
+    calls = []
+    reports = []
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli_module, 'train', lambda *args: calls.append(args) or {})
+    monkeypatch.setattr(cli_module, 'comparison', lambda output: reports.append(str(output)) or {})
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: False)
+    argv = ['looped-transformer-comparison', command]
+    if command == 'train':
+        argv += ['--architecture', 'standard']
+    monkeypatch.setattr(sys, 'argv', argv)
+    cli_module.main()
+    assert len(calls) == {'train': 1, 'compare': 2, 'report': 0}[command]
+    for call in calls:
+        assert call[:2] == ('configs/h100.json', 'data/wikitext2')
+        expected = 'runs/h100-350m' + ('/' + call[3] if command == 'compare' else '')
+        assert str(call[2]) == expected
+    assert reports == ([] if command == 'train' else ['runs/h100-350m'])
