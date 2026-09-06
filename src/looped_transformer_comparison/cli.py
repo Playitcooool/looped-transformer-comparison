@@ -60,6 +60,8 @@ def main():
     p.add_argument('--device', default='auto')
     p = sub.add_parser('check')
     p.add_argument('--require-cuda', action='store_true')
+    p.add_argument('--require-h100', action='store_true',
+                   help='require a selected H100 with at least 75 GiB and BF16 support')
     a = parser.parse_args()
     if a.command == 'prepare':
         print(json.dumps(prepare(a.output, a.vocab_size, a.local_dir, a.dataset_config), indent=2))
@@ -117,14 +119,21 @@ def main():
         print(tokenizer.decode(ids))
     elif a.command == 'check':
         available = torch.cuda.is_available()
+        devices = [{'name': torch.cuda.get_device_name(i),
+                    'memory_gib': torch.cuda.get_device_properties(i).total_memory / 2**30}
+                   for i in range(torch.cuda.device_count())]
+        bf16 = torch.cuda.is_bf16_supported() if available else False
+        selected = devices[torch.cuda.current_device()] if available else None
         print(json.dumps({'torch': str(torch.__version__), 'cuda_build': torch.version.cuda,
-                          'cuda_available': available,
-                          'devices': [{'name': torch.cuda.get_device_name(i),
-                                       'memory_gib': torch.cuda.get_device_properties(i).total_memory / 2**30}
-                                      for i in range(torch.cuda.device_count())],
-                          'bf16': torch.cuda.is_bf16_supported() if available else False}, indent=2))
-        if a.require_cuda and (not available or not torch.cuda.is_bf16_supported()):
+                          'cuda_available': available, 'devices': devices,
+                          'selected_device': selected, 'bf16': bf16}, indent=2))
+        if (a.require_cuda or a.require_h100) and (not available or not bf16):
             raise SystemExit('CUDA with bf16 support required for configs/h100.json')
+        if a.require_h100 and ('H100' not in selected['name'].upper()
+                               or selected['memory_gib'] < 75):
+            raise SystemExit(
+                'A full NVIDIA H100 80GB is required: selected device must contain '
+                '"H100" and expose at least 75 GiB')
 
 
 if __name__ == '__main__':
