@@ -64,3 +64,15 @@ The planner test independently computes its cost formula and checks both sides o
 A real short watchdog test launches a sleeping Python worker and its subprocess, then verifies that the deadline sends SIGTERM to both members of their process group. Nonzero worker exits are also detected. This is a local Unix watchdog check, not an eight-hour endurance test or a Slurm deployment test.
 
 Preparation tests compare actual train-only BPE output against independently reconstructed line encodings, including CRLF, blank lines and a final line without a newline. A mocked encoder produces **1,200,003 tokens per split** to exercise the million-token flush boundary and verify exact token counts and EOS positions. This checks bounded output buffering without downloading the full corpus. WikiText-103 download, full-corpus preparation, H100 throughput/memory and the eight-hour production run remain unverified. Calibration supplies a conservative estimate; actual elapsed time can differ, and an overrun produces an incomplete comparison rather than unequal training budgets presented as a completed experiment.
+
+## H100 startup guard
+
+Independently verified 2026-09-05 on the same CPU-only macOS environment. Focused guard, wrapper, entry-point, shell and dispatch checks: **10 passed, 28 deselected in 3.24 seconds**. Full suite: **38 passed in 16.25 seconds**.
+
+Mocked CUDA states verify that `check --require-h100` rejects no CUDA, missing BF16 support, a selected A100, and a selected H100 exposing only 74.9 GiB. It accepts a selected H100 at the 75 GiB boundary. A two-device case exposes a valid 80 GiB H100 as device 0 while selecting an 80 GiB A100 as device 1; rejection confirms that the guard checks `torch.cuda.current_device()` rather than accepting another visible H100.
+
+An executable wrapper test substitutes `uv`, records invocations, and forces the hardware check to fail. `scripts/train.sh` propagates that failure after only the `check --require-h100` invocation, never invokes `budget`, and does not create the requested output path. The success path records the hardware check before budget dispatch. `scripts/train.sbatch` delegates to this wrapper, so the same guard runs inside the scheduler allocation. All shell and Slurm scripts pass `bash -n`, and `uv lock --check` succeeds.
+
+Both the installed `looped-transformer-comparison check` entry point and `python -m looped_transformer_comparison.cli check` return valid JSON without a `RuntimeWarning`. The installed launcher initially reflected the prior package entry point until `uv sync --locked` regenerated it. Repository scripts invoke the module directly through the project environment, avoiding dependence on stale generated console-launcher contents after a source update.
+
+All GPU capability outcomes above are mocked control-flow tests. No physical H100, CUDA kernel, BF16 computation, MIG allocation, Slurm scheduling, GPU memory measurement, throughput measurement, or production training run was available for this verification.

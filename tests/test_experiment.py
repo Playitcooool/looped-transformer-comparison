@@ -176,6 +176,100 @@ def test_shell_syntax_and_lock():
     cli('check')
     if not torch.cuda.is_available(): cli('check','--require-cuda',success=False)
 
+
+@pytest.mark.parametrize(
+    'available,bf16,names,memory_gib,selected,success,error',
+    [
+        (False, False, [], [], 0, False, 'CUDA with bf16 support required'),
+        (True, False, ['NVIDIA H100 80GB HBM3'], [80], 0, False,
+         'CUDA with bf16 support required'),
+        (True, True, ['NVIDIA A100-SXM4-80GB'], [80], 0, False,
+         'A full NVIDIA H100 80GB is required'),
+        (True, True, ['NVIDIA H100 64GB'], [74.9], 0, False,
+         'A full NVIDIA H100 80GB is required'),
+        (True, True, ['NVIDIA H100 80GB HBM3'], [75], 0, True, None),
+        # An acceptable H100 elsewhere must not mask an unacceptable selected GPU.
+        (True, True, ['NVIDIA H100 80GB HBM3', 'NVIDIA A100-SXM4-80GB'],
+         [80, 80], 1, False, 'A full NVIDIA H100 80GB is required'),
+    ],
+)
+def test_require_h100_checks_selected_device(monkeypatch, capsys, available, bf16,
+                                              names, memory_gib, selected, success, error):
+    from looped_transformer_comparison import cli as cli_module
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: available)
+    monkeypatch.setattr(torch.cuda, 'is_bf16_supported', lambda: bf16)
+    monkeypatch.setattr(torch.cuda, 'device_count', lambda: len(names))
+    monkeypatch.setattr(torch.cuda, 'current_device', lambda: selected)
+    monkeypatch.setattr(torch.cuda, 'get_device_name', lambda index: names[index])
+    monkeypatch.setattr(
+        torch.cuda, 'get_device_properties',
+        lambda index: type('Properties', (), {'total_memory': memory_gib[index] * 2**30})(),
+    )
+    monkeypatch.setattr(sys, 'argv', ['looped-transformer-comparison', 'check', '--require-h100'])
+    if success:
+        cli_module.main()
+    else:
+        with pytest.raises(SystemExit, match=error):
+            cli_module.main()
+    report = json.loads(capsys.readouterr().out)
+    assert report['cuda_available'] is available
+    assert report['bf16'] is bf16
+    if available:
+        assert report['selected_device']['name'] == names[selected]
+        assert report['selected_device']['memory_gib'] == pytest.approx(memory_gib[selected])
+    else:
+        assert report['selected_device'] is None
+
+
+def test_train_wrapper_checks_h100_before_budget_and_creates_no_state_on_failure(tmp_path):
+    fake_bin = tmp_path / 'bin'
+    fake_bin.mkdir()
+    fake_uv = fake_bin / 'uv'
+    fake_uv.write_text(
+        '#!/usr/bin/env bash\n'
+        'printf "%s\\n" "$*" >> "$FAKE_UV_LOG"\n'
+        'for arg in "$@"; do\n'
+        '  if [[ "$arg" == "check" && "${FAKE_GUARD_FAIL:-0}" == "1" ]]; then exit 43; fi\n'
+        'done\n'
+    )
+    fake_uv.chmod(0o755)
+    log = tmp_path / 'uv.log'
+    output = tmp_path / 'run-output'
+    env = {**os.environ, 'PATH': f'{fake_bin}{os.pathsep}{os.environ["PATH"]}',
+           'FAKE_UV_LOG': str(log)}
+    command = [str(ROOT / 'scripts/train.sh'), '--output', str(output)]
+
+    failed = subprocess.run(command, cwd=ROOT, env={**env, 'FAKE_GUARD_FAIL': '1'},
+                            capture_output=True, text=True)
+    assert failed.returncode == 43
+    assert log.read_text().splitlines() == [
+        'run --no-sync python -m looped_transformer_comparison.cli check --require-h100'
+    ]
+    assert not output.exists()
+
+    log.unlink()
+    passed = subprocess.run(command, cwd=ROOT, env=env, capture_output=True, text=True)
+    assert passed.returncode == 0, passed.stdout + passed.stderr
+    assert log.read_text().splitlines() == [
+        'run --no-sync python -m looped_transformer_comparison.cli check --require-h100',
+        f'run --no-sync python -m looped_transformer_comparison.cli budget --output {output}',
+    ]
+
+
+def test_console_entrypoint_and_module_execution_have_no_runpy_warning():
+    env = {**os.environ, 'OMP_NUM_THREADS': '1', 'MKL_NUM_THREADS': '1',
+           'TOKENIZERS_PARALLELISM': 'false'}
+    commands = [
+        ['uv', 'run', '--no-sync', 'looped-transformer-comparison', 'check'],
+        ['uv', 'run', '--no-sync', 'python', '-m', 'looped_transformer_comparison.cli', 'check'],
+    ]
+    for command in commands:
+        result = subprocess.run(command, cwd=ROOT, env=env, capture_output=True,
+                                text=True, timeout=90)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert json.loads(result.stdout)['cuda_available'] is torch.cuda.is_available()
+        assert 'RuntimeWarning' not in result.stderr
+
 @pytest.mark.parametrize('name',['auto','cuda','cuda:2'])
 def test_cuda_device_selection_mocked(monkeypatch,name):
     from looped_transformer_comparison.engine import device_for
@@ -373,7 +467,8 @@ def test_default_budget_dispatch_and_production_controls(monkeypatch):
     old = json.loads((ROOT / 'configs/h100.json').read_text())
     assert c['model'] == old['model']
     assert c['training']['steps'] == 1_000_000 and c['training']['eval_every'] == 500
-    assert 'comparison budget' in (ROOT / 'scripts/train.sh').read_text()
+    wrapper = (ROOT / 'scripts/train.sh').read_text()
+    assert wrapper.index('check --require-h100') < wrapper.index(' budget "$@"')
     assert '#SBATCH --time=08:00:00' in (ROOT / 'scripts/train.sbatch').read_text()
     monkeypatch.setattr(cli_module, 'prepare', lambda *args: calls.append(args) or {})
     monkeypatch.setattr(sys, 'argv', ['looped-transformer-comparison', 'prepare'])

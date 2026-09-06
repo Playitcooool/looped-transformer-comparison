@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.scripts]
-looped-transformer-comparison = "looped_transformer_comparison:main"
+looped-transformer-comparison = "looped_transformer_comparison.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.11.21,<0.12.0"]

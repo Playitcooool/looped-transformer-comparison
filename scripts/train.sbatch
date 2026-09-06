@@ -11,5 +11,4 @@ set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:?Submit from the repository root}"
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
 # Scheduler owns CUDA_VISIBLE_DEVICES; do not override it here.
-./scripts/check.sh --require-cuda
 ./scripts/train.sh "$@"

@@ -28,7 +28,7 @@ Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and a comp
 
 ```bash
 ./scripts/setup.sh
-./scripts/check.sh --require-cuda
+./scripts/check.sh --require-h100
 # Prepare the larger dataset BEFORE the timed GPU job:
 ./scripts/prepare.sh
 # Calibration + both main runs, eight hours total:
@@ -38,6 +38,8 @@ Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and a comp
 Preparation now defaults to `wikitext-103-raw-v1` under `data/wikitext103`. Existing WikiText-2 data does not become WikiText-103: prepare the new directory once. Fresh larger-data training cannot resume the old tokenizer/checkpoints.
 
 The lock selects PyTorch 2.14.0 with CUDA 13 Linux dependencies and glibc 2.28+ wheels. CUDA 13 normally needs an R580-or-newer NVIDIA driver; see [NVIDIA compatibility guidance](https://docs.nvidia.com/deploy/cuda-compatibility/latest/forward-compatibility.html). `setup.sh` uses the project-local Python 3.12 environment and committed `uv.lock`. It does not change the host driver. The H100 preset requires BF16; verify the CUDA build and visible device using `check.sh`. On an older cluster runtime, resolve a compatible PyTorch build before both arms, rather than mixing runtimes between models.
+
+`scripts/train.sh` begins with the same hardware check and exits before calibration or run-directory creation unless the selected CUDA device reports H100, exposes at least 75 GiB, and supports BF16. This catches SSH login nodes, CPU-only PyTorch installations, other GPU types, and restricted H100 partitions. On a scheduled cluster, run it inside an H100 allocation through `sbatch scripts/train.sbatch`.
 
 ```bash
 # Keep running after an SSH disconnect:
@@ -75,7 +77,7 @@ Resume does not grant another eight hours; downtime counts against the original 
 After the deadline, you may explicitly continue in **a new allocation outside the original eight-hour budget**:
 
 ```bash
-uv run looped-transformer-comparison compare \
+uv run python -m looped_transformer_comparison.cli compare \
   --config runs/h100-350m-wiki103-8h/resolved-config.json \
   --data data/wikitext103 --output runs/h100-350m-wiki103-8h --resume
 ```
@@ -109,9 +111,9 @@ Results report parameter counts, held-out loss/perplexity, training tokens, trai
 ./scripts/evaluate.sh --checkpoint runs/h100-350m-wiki103-8h/standard/best.pt
 ./scripts/infer.sh --checkpoint runs/h100-350m-wiki103-8h/looped/best.pt --prompt 'The history of science'
 # Fixed-step experiment (not time bounded):
-uv run looped-transformer-comparison compare --config configs/h100.json --output runs/fixed350m
+uv run python -m looped_transformer_comparison.cli compare --config configs/h100.json --output runs/fixed350m
 # One architecture only:
-uv run looped-transformer-comparison train --architecture standard --output runs/single
+uv run python -m looped_transformer_comparison.cli train --architecture standard --output runs/single
 # Debug synchronous CUDA errors:
 ./scripts/debug.sh --architecture looped --output runs/debug --stop-after 1
 ```
@@ -126,7 +128,7 @@ Standalone evaluation uses FP32 for portability; main H100 reports use configure
 uv run pytest -q
 # Small numerical check via the FIXED-step command:
 ./scripts/prepare.sh --dataset-config wikitext-2-raw-v1 --output data/smoke --vocab-size 512
-uv run looped-transformer-comparison compare --config configs/smoke.json --data data/smoke --output runs/smoke
+uv run python -m looped_transformer_comparison.cli compare --config configs/smoke.json --data data/smoke --output runs/smoke
 ```
 
 `configs/smoke.json` is for CPU verification. `configs/h100.json` preserves the fixed 2,000-step 350M experiment, and `configs/h100-small.json` preserves the earlier 42M model. The timed default uses `configs/h100-8h.json`; its million-step value is an upper bound, not a promise to run that many steps. Pass `--config` to the timed runner to change architecture, seed or other settings, keeping a fresh output directory. Different loop factors must preserve depth, e.g. 24 = 12×2, 6×4 or 3×8. Use 24×1 for the architecture-equivalence control.
